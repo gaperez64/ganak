@@ -1,0 +1,14 @@
+c GRCS-style circuit: 2x4 grid: H^8 CZ-even CZ-odd pattern T^8 H^8
+c c RUN: %solver --mode 6 --rw 1 %s | %OutputCheck %s
+p cnf 8 0
+c t wmc
+c rw_sop 8 8 0 1 1 1 1 1 1 1 1
+c rw_edge 0 1
+c rw_edge 1 2
+c rw_edge 2 3
+c rw_edge 3 4
+c rw_edge 4 5
+c rw_edge 5 6
+c rw_edge 6 7
+c c CHECK: ^s SATISFIABLE$
+c c CHECK: ^c s exact quadruple float 5\.65685425e\+00 \+ 1\.76568542e\+01i$

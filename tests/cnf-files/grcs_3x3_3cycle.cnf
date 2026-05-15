@@ -1,0 +1,19 @@
+c GRCS-style circuit: 3x3 grid: H^9 CZ-all-grid-edges H^9 — complete 3x3 grid entanglement
+c c RUN: %solver --mode 1 --rw 1 %s | %OutputCheck %s
+p cnf 9 0
+c t wmc
+c rw_sop 9 8 0 0 0 0 0 0 0 0 0 0
+c rw_edge 0 1
+c rw_edge 0 3
+c rw_edge 1 2
+c rw_edge 1 4
+c rw_edge 2 5
+c rw_edge 3 4
+c rw_edge 3 6
+c rw_edge 4 5
+c rw_edge 4 7
+c rw_edge 5 8
+c rw_edge 6 7
+c rw_edge 7 8
+c c CHECK: ^s SATISFIABLE$
+c c CHECK: ^c o exact quadruple float 6\.40*e\+01$
