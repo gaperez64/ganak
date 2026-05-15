@@ -1,0 +1,7 @@
+c c RUN: %solver --mode 1 --rw 1 %s | %OutputCheck %s
+p cnf 2 0
+c t wmc
+c rw_sop 2 8 0 0 0
+c rw_edge 0 1
+c c CHECK: ^s SATISFIABLE$
+c c CHECK: ^c o exact quadruple float 2.0*e\+00$

@@ -84,6 +84,10 @@ struct CounterConfiguration {
   double freq_score_divisor = 25.0;
   uint32_t tot_used_cutoff_vivif = 50;
 
+  // Rank-width DP options (SOP algorithm for quantum circuits)
+  int do_rw = 0;        // 0 = disabled, 1 = use SOP DP when c rw_sop metadata present
+  int rw_max_k = 12;    // skip SOP DP if computed rank-width exceeds this
+
   int do_td = 1;
   uint32_t td_varlim = 150000;
   double td_ratiolim = 100.0;

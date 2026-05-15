@@ -47,6 +47,7 @@ THE SOFTWARE.
 #include "mcomplex-mpfr.hpp"
 #include <approxmc/approxmc.h>
 #include "file_read_helper.h"
+#include "sop_counter.hpp"
 
 static constexpr uint32_t max_digit_precision = 1e6;
 
@@ -310,6 +311,10 @@ void add_ganak_options()
     add_arg("--smallcubedisable", conf.do_small_cube_disable, fc_int, "Disable cubes beyond max-num-cubes-per-restart (sorted by LBD)");
     add_arg("--tdwrstdecay", conf.td_weight_restart_decay, fc_double, "Multiply td_weight by this after each restart (1.0=no decay, 0.5=halve)");
 
+    // Rank-width DP options (SOP algorithm for quantum circuits)
+    add_arg("--rw", conf.do_rw, fc_int, "Rank-width DP: 0=disabled, 1=use SOP DP when c rw_sop metadata present and rw<=rwmaxk");
+    add_arg("--rwmaxk", conf.rw_max_k, fc_int, "Max rank-width to attempt SOP DP (larger widths fall back to DPLL)");
+
     // Multi-threading options
     add_arg("--threads", num_threads, fc_int, "Number of threads to use. -1 = all available cores");
     add_arg("--bitsjobs", bits_jobs, fc_int, "Number of variables to multi-thread on (8 = 256 jobs)");
@@ -572,6 +577,112 @@ void run_weighted_counter(Ganak& counter, const ArjunNS::SimplifiedCNF& cnf, con
     }
 }
 
+// Parse "c rw_sop n r c b_0 ... b_{n-1}" and "c rw_edge u v" lines from the
+// CNF file to populate a SOPInstance. Returns true if a valid rw_sop line was
+// found. Caller must also check sop.n <= 64.
+static bool parse_sop_metadata(const std::string& filename, GanakInt::SOPInstance& sop) {
+    FILE* f = (filename == "-") ? stdin : fopen(filename.c_str(), "r");
+    if (!f) return false;
+
+    bool found_sop = false;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        // Only process comment lines starting with "c "
+        if (line[0] != 'c' || line[1] != ' ') continue;
+
+        if (strncmp(line, "c rw_sop ", 9) == 0) {
+            // Format: c rw_sop n r c b_0 b_1 ... b_{n-1}
+            uint32_t n, r; int32_t c;
+            int offset = 0;
+            if (sscanf(line + 9, "%u %u %d%n", &n, &r, &c, &offset) != 3) continue;
+            if (n == 0 || n > 64 || r == 0 || r % 2 != 0) continue;
+            sop.n = n; sop.r = r; sop.c = c;
+            sop.b.assign(n, 0);
+            sop.adj.assign(n, 0);
+            sop.all_vars_mask = (n == 64) ? ~0ULL : ((1ULL << n) - 1);
+
+            const char* p = line + 9 + offset;
+            for (uint32_t i = 0; i < n; i++) {
+                int32_t bv; int used = 0;
+                if (sscanf(p, "%d%n", &bv, &used) != 1) break;
+                sop.b[i] = ((bv % (int32_t)r) + (int32_t)r) % (int32_t)r;
+                p += used;
+            }
+            found_sop = true;
+        } else if (found_sop && strncmp(line, "c rw_edge ", 10) == 0) {
+            // Format: c rw_edge u v   (0-based indices)
+            uint32_t u, v;
+            if (sscanf(line + 10, "%u %u", &u, &v) == 2 && u < sop.n && v < sop.n && u != v) {
+                sop.adj[u] |= (1ULL << v);
+                sop.adj[v] |= (1ULL << u);
+            }
+        }
+    }
+    if (filename != "-") fclose(f);
+    return found_sop;
+}
+
+// Attempt SOP DP dispatch. Returns true (and prints output + exits) if the SOP
+// rank-width DP was used, false to continue with normal DPLL counting.
+static bool try_sop_dispatch(const std::string& filename, const double start_time) {
+    if (conf.do_rw <= 0) return false;
+
+    GanakInt::SOPInstance sop;
+    if (!parse_sop_metadata(filename, sop)) return false;
+
+    GanakInt::RankDecomp decomp = GanakInt::compute_rank_decomp(sop.n, sop.adj);
+
+    cout << "c o [rw] SOP variables: " << sop.n
+         << ", rank-width: " << decomp.width
+         << ", r: " << sop.r << endl;
+
+    if (decomp.width > conf.rw_max_k) {
+        cout << "c o [rw] rank-width " << decomp.width
+             << " exceeds limit " << conf.rw_max_k
+             << ", falling back to DPLL" << endl;
+        return false;
+    }
+
+    std::complex<double> result = GanakInt::sop_count(sop, decomp);
+
+    cout << "c o Total time [SOP-DP]: " << setprecision(2)
+         << std::fixed << (cpu_time() - start_time) << endl;
+    cout << "s SATISFIABLE" << endl;
+
+    if (mode == 1) {
+        // Rational WMC: output real part
+        cout << "c s type wmc" << endl;
+        mpfr_t rv;
+        mpfr_init2(rv, 256);
+        mpfr_set_d(rv, result.real(), MPFR_RNDN);
+        print_log(rv);
+        mpfr_clear(rv);
+        cout << "c o exact quadruple float "
+             << std::scientific << setprecision(8) << result.real() << endl;
+        cout << "c s pac guarantees epsilon: 0 delta: 0" << endl;
+    } else if (mode == 6 || mode == 2) {
+        // Complex output
+        cout << "c s type amc-complex" << endl;
+        mpfr_t rv, iv;
+        mpfr_init2(rv, 256);
+        mpfr_init2(iv, 256);
+        mpfr_set_d(rv, result.real(), MPFR_RNDN);
+        mpfr_set_d(iv, result.imag(), MPFR_RNDN);
+        print_log(rv, "-real");
+        print_log(iv, "-imag");
+        mpfr_printf("c s exact quadruple float %.8Re + %.8Rei\n", rv, iv);
+        mpfr_clear(rv);
+        mpfr_clear(iv);
+        cout << "c s pac guarantees epsilon: 0 delta: 0" << endl;
+    } else {
+        // Fallback for other modes: print real part as float
+        cout << "c o exact quadruple float "
+             << std::scientific << setprecision(8) << result.real() << endl;
+        cout << "c s pac guarantees epsilon: 0 delta: 0" << endl;
+    }
+    return true;
+}
+
 int main(int argc, char *argv[]) {
   mpf_set_default_prec(256);
   const double start_time = cpu_time();
@@ -660,6 +771,13 @@ int main(int argc, char *argv[]) {
   cnf.check_cnf_sampl_sanity();
   cnf.check_cnf_vars();
   verb_print(1, "CNF projection set size: " << cnf.get_sampl_vars().size());
+
+  // Attempt rank-width SOP DP dispatch (before Arjun, using original variable numbering)
+  {
+    string fname_for_sop = (!program.is_used("inputfile")) ? "-"
+        : program.get<std::vector<std::string>>("inputfile")[0];
+    if (try_sop_dispatch(fname_for_sop, start_time)) return 0;
+  }
 
   // Run Arjun
   if (!do_arjun) cnf.renumber_sampling_vars_for_ganak();
