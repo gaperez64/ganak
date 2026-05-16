@@ -734,7 +734,7 @@ static bool try_tw_dispatch(const ArjunNS::SimplifiedCNF& cnf, const double star
         inst, conf.tw_max_k, conf.td_steps, conf.td_iters, conf.verb);
 
     if (!result) {
-        cout << "c o [tw] treewidth exceeds limit " << conf.tw_max_k
+        cout << "c o [tw] incidence-graph treewidth exceeds limit " << conf.tw_max_k
              << ", falling back to DPLL" << endl;
         return false;
     }
