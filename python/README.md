@@ -56,12 +56,14 @@ print(c.count())               # → 0.58  (Python float)
 
 ## `Counter` API
 
-### `Counter(verbose=0, seed=0)`
+### `Counter(verbose=0, seed=0, use_tw=False, tw_max=20)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `verbose` | `int` | `0` | Verbosity level (0 = silent) |
 | `seed`    | `int` | `0` | Random seed for the solver |
+| `use_tw`  | `bool`| `False` | Attempt the FPT junction-tree DP on the incidence-graph tree decomposition before falling back to DPLL.  Only triggers when the projection set covers all variables.  The DP is double-precision real, so #SAT counts above 2<sup>53</sup> lose exact-integer precision via this path. |
+| `tw_max`  | `int` | `20` | Maximum treewidth at which the DP is used; on instances with larger treewidth the DP is skipped and the standard pipeline runs. |
 
 ### `add_clause(clause)`
 
@@ -105,13 +107,15 @@ Declare extra variables, or query the current variable / clause count.
 
 ## `WeightedCounter` API
 
-### `WeightedCounter(verbose=0, seed=0, prec=128)`
+### `WeightedCounter(verbose=0, seed=0, prec=128, use_tw=False, tw_max=20)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `verbose` | `int` | `0` | Verbosity level |
 | `seed`    | `int` | `0` | Random seed |
 | `prec`    | `int` | `128` | MPFR precision in bits (≥ 2) |
+| `use_tw`  | `bool`| `False` | Attempt the FPT junction-tree DP first (double precision; *ignores `prec`*). Triggers only when the projection set covers all variables. Per-literal weights are forwarded into the DP. |
+| `tw_max`  | `int` | `20` | Treewidth cap for the DP; above this the DP is skipped and the MPFR DPLL pipeline runs. |
 
 The internal arithmetic is performed with MPFR at `prec` bits of precision
 (default 128 ≈ 38 significant decimal digits).  The final result is returned
@@ -149,6 +153,71 @@ Identical to the `Counter` versions.
 Run Arjun preprocessing + Ganak weighted model counting.  Returns the
 weighted count as a Python `float`.  The internal computation uses MPFR at
 the configured precision.  May only be called **once** per instance.
+
+---
+
+## `SOPCounter` API
+
+Rank-width FPT DP for *quadratic sum-of-powers* (the structured form that
+arises from Clifford+T quantum simulation via the Feynman path integral).
+The input is a graph (the interaction graph), not a CNF, so it has its own
+class rather than being grafted onto `Counter` / `WeightedCounter`.
+
+`SOPCounter` computes
+
+$$Z = \sum_{x \in \{0,1\}^n} \omega_r^{f(x)}, \qquad f(x) = c + \sum_v b_v\, x_v + \tfrac{r}{2}\!\!\sum_{(u,v)\in E}\! x_u\, x_v \pmod{r}$$
+
+via Algorithm 1 (Fourier-mode, *a = 1*) of "WMC for Quantum Simulation Also
+Breaks the Treewidth Barrier".  Running time is `O(n · r · 4^k · poly(n))`
+where `k` is the rank-width of the interaction graph.
+
+### `SOPCounter(n, r=8, c=0, rw_max=12, verbose=0)`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `n`       | `int` | — | Number of SOP variables.  Internal adjacency uses a 64-bit mask per vertex, so `1 ≤ n ≤ 64`. |
+| `r`       | `int` | `8` | Modulus (must be a positive even integer; `r = 8` matches the H + T + CZ gate set). |
+| `c`       | `int` | `0` | Constant term in `f` (taken mod `r`). |
+| `rw_max`  | `int` | `12` | Maximum rank-width at which `count()` will run; above this it raises `RuntimeError`. |
+| `verbose` | `int` | `0` | Verbosity level. |
+
+### `set_b(coefs)` / `set_b_v(v, b_v)`
+
+Set per-vertex coefficients `b_v` (taken mod `r`).  `set_b` takes an iterable
+of exactly `n` integers; `set_b_v` updates a single vertex.
+
+### `add_edge(u, v)`
+
+Add an undirected edge `{u, v}` to the interaction graph.  Both endpoints
+must be in `[0, n)` and `u != v`.
+
+### `rank_width() → int`
+
+Return the rank-width of the current interaction graph (uses the same greedy
+bipartition as `count()`).  Useful for deciding whether `count()` will fit
+inside `rw_max` before paying for the DP.
+
+### `count() → complex`
+
+Run the Fourier-mode rank-width DP and return the amplitude `Z` as a Python
+`complex`.  Raises `RuntimeError` if the rank-width exceeds `rw_max`.  May
+only be called **once** per instance.
+
+```python
+from pyganak import SOPCounter
+
+# qc_2qubit:  H⊗H · CZ · H⊗H — n=2, r=8, all b=0, edge (0,1) — Z = 2.
+s = SOPCounter(n=2, r=8)
+s.add_edge(0, 1)
+print(s.count())          # (2+0j)
+
+# grcs_2x2_5cycle:  4 T-gates, two layers of CZ.  Z = 0 + 3.6568542…i
+g = SOPCounter(n=4, r=8)
+g.set_b([1, 1, 1, 1])
+for u, v in [(0, 1), (0, 2), (1, 3), (2, 3)]:
+    g.add_edge(u, v)
+print(g.count())          # ≈ 3.6568542j
+```
 
 ---
 
@@ -214,6 +283,39 @@ c.set_lit_weight( 1, 0.1);  c.set_lit_weight(-1, 0.9)
 c.set_lit_weight( 2, 0.2);  c.set_lit_weight(-2, 0.8)
 c.set_lit_weight( 3, 0.5);  c.set_lit_weight(-3, 0.5)
 print(c.count())
+```
+
+### Treewidth dispatch (`use_tw`)
+
+```python
+from pyganak import Counter, WeightedCounter
+
+# Same triangle CNF runs ~10× faster via the FPT DP on large structured
+# instances; on this tiny one it just produces the same answer.
+c = Counter(use_tw=True, tw_max=10)
+c.add_clause([1, 2]); c.add_clause([2, 3]); c.add_clause([1, 3])
+print(c.count())                  # 4
+
+w = WeightedCounter(use_tw=True, tw_max=10)
+w.add_clause([1, 2]); w.add_clause([2, 3]); w.add_clause([1, 3])
+for v, (p, n) in [(1, (.8, .2)), (2, (.6, .4)), (3, (.7, .3))]:
+    w.set_lit_weight( v, p)
+    w.set_lit_weight(-v, n)
+print(w.count())                  # 0.788 = 197/250
+```
+
+### Rank-width SOP counting
+
+```python
+from pyganak import SOPCounter
+
+# A 4-vertex grid (rank-width 1) with all b=1 — equivalent CNF formulation
+# of a small GRCS-style circuit.  Run with no rank-width cap.
+s = SOPCounter(n=4, r=8, rw_max=12)
+s.set_b([1, 1, 1, 1])
+for u, v in [(0, 1), (0, 2), (1, 3), (2, 3)]:
+    s.add_edge(u, v)
+print(s.rank_width(), s.count())  # 1 (≈3.657j)
 ```
 
 ---
