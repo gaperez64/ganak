@@ -36,6 +36,24 @@ static int sorted_pos(int val, const std::vector<int>& vec) {
     return (it != vec.end() && *it == val) ? (int)(it - vec.begin()) : -1;
 }
 
+// Junction-tree WMC on an incidence-graph tree decomposition.
+//
+// Each bag t holds a mix of variable-nodes V_t and clause-nodes C_t. The DP
+// table at t is indexed by a mask of size |V_t| + |C_t|:
+//   low |V_t| bits = truth assignment of variables in V_t (1 = true)
+//   high |C_t| bits = "has this clause been satisfied so far in t's subtree?"
+//
+// Per-edge ownership: every literal (v in clause c) is a graph edge in the
+// incidence graph. The TD property guarantees at least one bag contains both
+// v and the clause-node n+c. We pick one owner bag per edge; at that bag we
+// OR-update the clause's sat bit using v's current assignment.
+//
+// Forgetting: when going from a child bag b to its parent t, variables in
+// V_b \ V_t are marginalised (sum, weighted by pos_w / neg_w) and clauses in
+// C_b \ C_t are required to be satisfied (sat=0 entries are dropped).
+//
+// At the root, remaining variables are marginalised and remaining clauses
+// must be satisfied.
 std::optional<std::complex<double>> tw_wmc_count(
     const TWInstance& inst,
     int max_tw,
@@ -49,9 +67,12 @@ std::optional<std::complex<double>> tw_wmc_count(
 
     if (n == 0) return std::complex<double>(1.0, 0.0);
 
+    // An empty clause is unsatisfiable.
+    for (uint32_t ci = 0; ci < m; ci++)
+        if (clauses[ci].empty()) return std::complex<double>(0.0, 0.0);
+
     // ---- Build incidence graph -------------------------------------------
     // Nodes 0..n-1 are variables; nodes n..n+m-1 are clauses.
-    // An edge connects variable v to clause-node n+ci whenever v appears in ci.
     TWD::Graph incidence(n + m);
     for (uint32_t ci = 0; ci < m; ci++)
         for (auto [v, neg] : clauses[ci])
@@ -62,7 +83,7 @@ std::optional<std::complex<double>> tw_wmc_count(
     fc.importGraph(incidence);
     auto td = fc.constructTD(td_steps, td_iters);
 
-    int tw = td.width() - 1;
+    int tw = td.width();  // already max_bag_size - 1 (standard treewidth)
     if (verb >= 1)
         std::cout << "c o [tw] incidence-graph treewidth: " << tw
                   << " (limit: " << max_tw << ")" << std::endl;
@@ -73,10 +94,10 @@ std::optional<std::complex<double>> tw_wmc_count(
     int nb = (int)bags.size();
     if (nb == 0) return std::complex<double>(1.0, 0.0);
 
-    // ---- Split bags into var-nodes and clause-nodes; sort var lists -------
+    // ---- Split bags into var-nodes and clause-nodes; sort both lists -----
     struct BagInfo {
-        std::vector<int> vars;   // sorted var indices (0..n-1)
-        std::vector<int> cls;    // clause indices (bag-node minus n)
+        std::vector<int> vars;  // sorted var indices (0..n-1)
+        std::vector<int> cls;   // sorted clause indices (bag-node minus n)
     };
     std::vector<BagInfo> bi(nb);
     for (int t = 0; t < nb; t++) {
@@ -85,6 +106,14 @@ std::optional<std::complex<double>> tw_wmc_count(
             else               bi[t].cls.push_back(node - (int)n);
         }
         std::sort(bi[t].vars.begin(), bi[t].vars.end());
+        std::sort(bi[t].cls.begin(),  bi[t].cls.end());
+        int bag_sz = (int)(bi[t].vars.size() + bi[t].cls.size());
+        if (bag_sz > 30) {
+            if (verb >= 0)
+                std::cerr << "c o [tw] bag " << t << " size " << bag_sz
+                          << " > 30; would overflow table mask\n";
+            return {};
+        }
     }
 
     // ---- Root the tree (BFS from node 0) ---------------------------------
@@ -109,122 +138,167 @@ std::optional<std::complex<double>> tw_wmc_count(
             }
         }
     }
-    // Post-order = reverse BFS (leaves before parents)
+    // Post-order: process children before parent.
     std::vector<int> postorder(bfs_order.rbegin(), bfs_order.rend());
 
-    // ---- Assign each clause to its deepest covering bag ------------------
-    // "Covering" means the bag contains the clause-node n+ci AND all var-nodes
-    // of the clause. The Helly property guarantees such a bag exists.
-    std::vector<std::vector<int>> bag_clauses(nb);
+    // ---- Per-edge ownership ----------------------------------------------
+    // For each incidence-graph edge (v, n+ci), pick any bag containing both
+    // endpoints and own the OR-update there.
+    struct EdgeOwner {
+        int vi;   // index of var in owner bag's V_t
+        int cj;   // index of clause in owner bag's C_t
+        bool neg; // polarity of v in clause ci (true = literal is ~v)
+    };
+    std::vector<std::vector<EdgeOwner>> bag_edges(nb);
     for (uint32_t ci = 0; ci < m; ci++) {
-        int owner = -1;
-        for (int t : postorder) {
-            // Does bag t contain clause-node ci?
-            bool has_cl = std::find(bi[t].cls.begin(), bi[t].cls.end(), (int)ci)
-                          != bi[t].cls.end();
-            if (!has_cl) continue;
-            // Does bag t contain all var-nodes of clause ci?
-            bool all_vars = true;
-            for (auto [v, neg] : clauses[ci])
-                if (sorted_pos((int)v, bi[t].vars) < 0) { all_vars = false; break; }
-            if (all_vars) { owner = t; break; }
+        for (auto [v, neg] : clauses[ci]) {
+            int owner = -1, owner_vi = -1, owner_cj = -1;
+            for (int t = 0; t < nb; t++) {
+                int vi = sorted_pos((int)v, bi[t].vars);
+                if (vi < 0) continue;
+                int cj = sorted_pos((int)ci, bi[t].cls);
+                if (cj < 0) continue;
+                owner = t; owner_vi = vi; owner_cj = cj;
+                break;
+            }
+            if (owner < 0) {
+                if (verb >= 0)
+                    std::cerr << "c o [tw] edge (var=" << v
+                              << ", clause=" << ci
+                              << ") has no covering bag; TD invalid\n";
+                return {};
+            }
+            bag_edges[owner].push_back({owner_vi, owner_cj, neg});
         }
-        if (owner < 0) {
-            if (verb >= 0)
-                std::cerr << "c o [tw] clause " << ci
-                          << " has no covering bag; TD invalid\n";
-            return {};
-        }
-        bag_clauses[owner].push_back((int)ci);
     }
 
     // ---- Junction-tree DP -----------------------------------------------
-    // table[t]: size 2^|bi[t].vars|, indexed by assignment bitmask.
-    // Bit i of bitmask = value of bi[t].vars[i].
-    //
-    // Variable weights are applied at the "forget" step: when var v is in
-    // bag t but NOT in parent(t), we sum over v's values weighted by pos_w/neg_w.
-    // Clause constraints are applied at each clause's owner bag.
     std::vector<std::vector<std::complex<double>>> tables(nb);
 
     for (int t : postorder) {
-        const auto& Vt = bi[t].vars;
-        int szt = (int)Vt.size();
-        uint32_t tsz = 1u << szt;
+        const int nv = (int)bi[t].vars.size();
+        const int nc = (int)bi[t].cls.size();
+        const uint64_t tsz = 1ull << (nv + nc);
+        const uint64_t var_mask = (nv > 0) ? ((1ull << nv) - 1ull) : 0ull;
 
         auto& tbl = tables[t];
-        tbl.assign(tsz, std::complex<double>(1.0, 0.0));
+        tbl.assign(tsz, std::complex<double>(0.0, 0.0));
+        // Each clause local to t starts unsatisfied (sat bits = 0).
+        for (uint64_t va = 0; va <= var_mask; va++)
+            tbl[va] = std::complex<double>(1.0, 0.0);
 
-        // Apply clause constraints owned by this bag.
-        for (int ci : bag_clauses[t]) {
-            std::vector<std::pair<int, bool>> local_cl;
-            local_cl.reserve(clauses[ci].size());
-            for (auto [v, neg] : clauses[ci])
-                local_cl.emplace_back(sorted_pos((int)v, Vt), neg);
+        // ---- Combine each child cb into tbl ------------------------------
+        for (int cb : ch[t]) {
+            const int cnv = (int)bi[cb].vars.size();
+            const int cnc = (int)bi[cb].cls.size();
+            const uint64_t cts = 1ull << (cnv + cnc);
 
-            for (uint32_t sigma = 0; sigma < tsz; sigma++) {
-                bool sat = false;
-                for (auto [li, neg] : local_cl) {
-                    int val = (sigma >> li) & 1;
-                    if (neg ? (val == 0) : (val == 1)) { sat = true; break; }
+            // Map child positions to parent positions (-1 = forgotten).
+            std::vector<int> cv_to_pv(cnv, -1);
+            for (int i = 0; i < cnv; i++)
+                cv_to_pv[i] = sorted_pos(bi[cb].vars[i], bi[t].vars);
+            std::vector<int> cc_to_pc(cnc, -1);
+            for (int j = 0; j < cnc; j++)
+                cc_to_pc[j] = sorted_pos(bi[cb].cls[j], bi[t].cls);
+
+            // Bits in the parent's var-mask that correspond to shared vars.
+            uint64_t parent_shared_var_mask = 0;
+            for (int i = 0; i < cnv; i++)
+                if (cv_to_pv[i] >= 0)
+                    parent_shared_var_mask |= (1ull << cv_to_pv[i]);
+
+            std::vector<std::complex<double>> new_tbl(tsz, std::complex<double>(0.0, 0.0));
+
+            for (uint64_t cs = 0; cs < cts; cs++) {
+                const std::complex<double>& base = tables[cb][cs];
+                if (base.real() == 0.0 && base.imag() == 0.0) continue;
+
+                // Forgotten clauses (in cb but not in t) must be satisfied.
+                bool valid = true;
+                for (int j = 0; j < cnc; j++) {
+                    if (cc_to_pc[j] < 0 && ((cs >> (cnv + j)) & 1) == 0) {
+                        valid = false; break;
+                    }
                 }
-                if (!sat) tbl[sigma] = 0.0;
+                if (!valid) continue;
+
+                // Apply forgotten-variable weights.
+                std::complex<double> contrib = base;
+                for (int i = 0; i < cnv; i++) {
+                    if (cv_to_pv[i] < 0) {
+                        int v = bi[cb].vars[i];
+                        contrib *= ((cs >> i) & 1) ? inst.pos_w[v] : inst.neg_w[v];
+                    }
+                }
+
+                // Shared-var bits expressed in parent positions.
+                uint64_t child_sv_in_parent = 0;
+                for (int i = 0; i < cnv; i++)
+                    if (cv_to_pv[i] >= 0 && ((cs >> i) & 1))
+                        child_sv_in_parent |= (1ull << cv_to_pv[i]);
+
+                // Shared-clause sat bits expressed in parent positions.
+                uint64_t child_sc_in_parent = 0;
+                for (int j = 0; j < cnc; j++)
+                    if (cc_to_pc[j] >= 0 && ((cs >> (cnv + j)) & 1))
+                        child_sc_in_parent |= (1ull << (nv + cc_to_pc[j]));
+
+                // Join: every parent state whose shared-var bits match
+                // child_sv_in_parent combines with this child state.
+                // The new parent sat bits are OR'd with the child's.
+                for (uint64_t ps_old = 0; ps_old < tsz; ps_old++) {
+                    if ((ps_old & parent_shared_var_mask) != child_sv_in_parent) continue;
+                    const std::complex<double>& v = tbl[ps_old];
+                    if (v.real() == 0.0 && v.imag() == 0.0) continue;
+                    uint64_t ps_new = ps_old | child_sc_in_parent;
+                    new_tbl[ps_new] += v * contrib;
+                }
             }
+
+            tbl = std::move(new_tbl);
+            tables[cb].clear();
+            tables[cb].shrink_to_fit();
         }
 
-        // Merge each child's (already weighted-marginalized) table.
-        for (int c : ch[t]) {
-            const auto& Vc = bi[c].vars;
-            int szc = (int)Vc.size();
-
-            // For each position in Vc: its position in Vt, or -1 (= forgotten).
-            std::vector<int> c2p(szc, -1);
-            for (int ci2 = 0; ci2 < szc; ci2++)
-                c2p[ci2] = sorted_pos(Vc[ci2], Vt);
-
-            std::vector<int> forget_pos;  // positions in Vc of vars not in Vt
-            for (int ci2 = 0; ci2 < szc; ci2++)
-                if (c2p[ci2] < 0) forget_pos.push_back(ci2);
-
-            uint32_t shared_mask = 0;
-            for (int ci2 = 0; ci2 < szc; ci2++)
-                if (c2p[ci2] >= 0) shared_mask |= (1u << c2p[ci2]);
-
-            // Compute marginal: sum child table over forgotten vars, weighted.
-            std::vector<std::complex<double>> marginal(tsz, 0.0);
-            const auto& ctbl = tables[c];
-            for (uint32_t sc = 0; sc < (1u << szc); sc++) {
-                // Multiply in weights for forgotten vars.
-                std::complex<double> contrib = ctbl[sc];
-                for (int fi : forget_pos) {
-                    int v = Vc[fi];
-                    int val = (sc >> fi) & 1;
-                    contrib *= val ? inst.pos_w[v] : inst.neg_w[v];
-                }
-                // Map to parent-table shared bits.
-                uint32_t st_bits = 0;
-                for (int ci2 = 0; ci2 < szc; ci2++)
-                    if (c2p[ci2] >= 0 && ((sc >> ci2) & 1))
-                        st_bits |= (1u << c2p[ci2]);
-                marginal[st_bits] += contrib;
+        // ---- Apply edge OR-updates owned by t ----------------------------
+        // For each owned literal (v, clause c, polarity neg), every state where
+        // c is not yet satisfied AND v's value satisfies the literal gets its
+        // sat bit forced to 1; the value moves from old state to new.
+        for (const auto& e : bag_edges[t]) {
+            uint64_t sat_bit = 1ull << (nv + e.cj);
+            uint64_t var_bit = 1ull << e.vi;
+            for (uint64_t st = 0; st < tsz; st++) {
+                if (st & sat_bit) continue;            // already satisfied
+                bool val_true = (st & var_bit) != 0;
+                bool literal_sat = e.neg ? !val_true : val_true;
+                if (!literal_sat) continue;
+                std::complex<double>& src = tbl[st];
+                if (src.real() == 0.0 && src.imag() == 0.0) continue;
+                tbl[st | sat_bit] += src;
+                src = std::complex<double>(0.0, 0.0);
             }
-
-            for (uint32_t st = 0; st < tsz; st++)
-                tbl[st] *= marginal[st & shared_mask];
-
-            tables[c].clear();
-            tables[c].shrink_to_fit();
         }
     }
 
-    // ---- Sum root table, applying weights for all root vars (all forgotten) --
+    // ---- Marginalize at the root ----------------------------------------
+    const int rnv = (int)bi[0].vars.size();
+    const int rnc = (int)bi[0].cls.size();
+    const uint64_t rtsz = 1ull << (rnv + rnc);
     std::complex<double> answer(0.0, 0.0);
-    const auto& Vr = bi[0].vars;
-    for (uint32_t sigma = 0; sigma < (1u << Vr.size()); sigma++) {
-        std::complex<double> w = tables[0][sigma];
-        for (int i = 0; i < (int)Vr.size(); i++)
-            w *= ((sigma >> i) & 1) ? inst.pos_w[Vr[i]] : inst.neg_w[Vr[i]];
-        answer += w;
+    for (uint64_t st = 0; st < rtsz; st++) {
+        // All remaining clauses must be satisfied.
+        bool ok = true;
+        for (int j = 0; j < rnc; j++) {
+            if (((st >> (rnv + j)) & 1) == 0) { ok = false; break; }
+        }
+        if (!ok) continue;
+        std::complex<double> contrib = tables[0][st];
+        if (contrib.real() == 0.0 && contrib.imag() == 0.0) continue;
+        for (int i = 0; i < rnv; i++) {
+            int v = bi[0].vars[i];
+            contrib *= ((st >> i) & 1) ? inst.pos_w[v] : inst.neg_w[v];
+        }
+        answer += contrib;
     }
     return answer;
 }
