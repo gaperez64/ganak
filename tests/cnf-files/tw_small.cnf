@@ -1,0 +1,10 @@
+c Small 3-variable formula to test treewidth FPT WMC dispatch
+c Clauses: (x1 v x2) /\ (x2 v x3) /\ (x1 v x3)
+c Primal graph is a triangle (tw=2). Model count = 4.
+c c RUN: %solver --tw 1 --twmaxk 5 %s | %OutputCheck %s
+p cnf 3 3
+1 2 0
+2 3 0
+1 3 0
+c c CHECK: ^s SATISFIABLE$
+c c CHECK: ^c s exact arb int 4$

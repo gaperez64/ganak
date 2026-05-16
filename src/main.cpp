@@ -48,6 +48,7 @@ THE SOFTWARE.
 #include <approxmc/approxmc.h>
 #include "file_read_helper.h"
 #include "sop_counter.hpp"
+#include "tw_counter.hpp"
 
 static constexpr uint32_t max_digit_precision = 1e6;
 
@@ -314,6 +315,10 @@ void add_ganak_options()
     // Rank-width DP options (SOP algorithm for quantum circuits)
     add_arg("--rw", conf.do_rw, fc_int, "Rank-width DP: 0=disabled, 1=use SOP DP when c rw_sop metadata present and rw<=rwmaxk");
     add_arg("--rwmaxk", conf.rw_max_k, fc_int, "Max rank-width to attempt SOP DP (larger widths fall back to DPLL)");
+
+    // Treewidth FPT WMC options
+    add_arg("--tw", conf.do_tw, fc_int, "Treewidth WMC: 0=disabled, 1=run junction-tree DP when primal tw<=twmaxk (after Arjun)");
+    add_arg("--twmaxk", conf.tw_max_k, fc_int, "Max treewidth to attempt junction-tree DP (larger widths fall back to DPLL)");
 
     // Multi-threading options
     add_arg("--threads", num_threads, fc_int, "Number of threads to use. -1 = all available cores");
@@ -683,6 +688,99 @@ static bool try_sop_dispatch(const std::string& filename, const double start_tim
     return true;
 }
 
+// Extract a Field element as complex<double>.
+static std::complex<double> field_to_cdbl(const CMSat::Field* f) {
+    if (!f) return {1.0, 0.0};
+    if (const auto* q = dynamic_cast<const ArjunNS::FMpq*>(f))
+        return {mpq_get_d(q->val.get_mpq_t()), 0.0};
+    if (const auto* z = dynamic_cast<const ArjunNS::FMpz*>(f))
+        return {mpz_get_d(z->val.get_mpz_t()), 0.0};
+    if (const auto* c = dynamic_cast<const MPFComplex*>(f))
+        return {mpfr_get_d(c->real, MPFR_RNDN), mpfr_get_d(c->imag, MPFR_RNDN)};
+    // Fallback: shouldn't be reached for modes 0/1/6
+    return {1.0, 0.0};
+}
+
+// Attempt junction-tree WMC dispatch (after Arjun simplification).
+// Returns true and prints output if the treewidth DP succeeds.
+static bool try_tw_dispatch(const ArjunNS::SimplifiedCNF& cnf, const double start_time) {
+    if (conf.do_tw <= 0) return false;
+
+    // Build TWInstance from the simplified CNF.
+    GanakInt::TWInstance inst;
+    inst.n = cnf.nVars();
+    inst.pos_w.assign(inst.n, {1.0, 0.0});
+    inst.neg_w.assign(inst.n, {1.0, 0.0});
+
+    if (cnf.get_weighted()) {
+        for (const auto& t : cnf.get_weights()) {
+            uint32_t v = t.first;  // 0-based
+            if (v < inst.n) {
+                inst.pos_w[v] = field_to_cdbl(t.second.pos.get());
+                inst.neg_w[v] = field_to_cdbl(t.second.neg.get());
+            }
+        }
+    }
+
+    for (const auto& cl : cnf.get_clauses()) {
+        std::vector<std::pair<uint32_t, bool>> tw_cl;
+        tw_cl.reserve(cl.size());
+        for (const auto& l : cl)
+            tw_cl.emplace_back(l.var(), l.sign());  // sign()==true means negated
+        inst.clauses.push_back(std::move(tw_cl));
+    }
+
+    auto result = GanakInt::tw_wmc_count(
+        inst, conf.tw_max_k, conf.td_steps, conf.td_iters, conf.verb);
+
+    if (!result) {
+        cout << "c o [tw] treewidth exceeds limit " << conf.tw_max_k
+             << ", falling back to DPLL" << endl;
+        return false;
+    }
+
+    cout << "c o Total time [TW-DP]: " << setprecision(2)
+         << std::fixed << (cpu_time() - start_time) << endl;
+    cout << "s SATISFIABLE" << endl;
+
+    if (mode == 1) {
+        cout << "c s type wmc" << endl;
+        mpfr_t rv;
+        mpfr_init2(rv, 256);
+        mpfr_set_d(rv, result->real(), MPFR_RNDN);
+        print_log(rv);
+        mpfr_clear(rv);
+        cout << "c o exact quadruple float "
+             << std::scientific << setprecision(8) << result->real() << endl;
+        cout << "c s pac guarantees epsilon: 0 delta: 0" << endl;
+    } else if (mode == 6 || mode == 2) {
+        cout << "c s type amc-complex" << endl;
+        mpfr_t rv, iv;
+        mpfr_init2(rv, 256);
+        mpfr_init2(iv, 256);
+        mpfr_set_d(rv, result->real(), MPFR_RNDN);
+        mpfr_set_d(iv, result->imag(), MPFR_RNDN);
+        print_log(rv, "-real");
+        print_log(iv, "-imag");
+        mpfr_printf("c s exact quadruple float %.8Re + %.8Rei\n", rv, iv);
+        mpfr_clear(rv);
+        mpfr_clear(iv);
+        cout << "c s pac guarantees epsilon: 0 delta: 0" << endl;
+    } else {
+        // mode 0: integer / unweighted model count
+        cout << "c s type mc" << endl;
+        mpfr_t rv;
+        mpfr_init2(rv, 256);
+        mpfr_set_d(rv, result->real(), MPFR_RNDN);
+        print_log(rv);
+        mpfr_clear(rv);
+        long long cnt = llround(result->real());
+        cout << "c s exact arb int " << cnt << endl;
+        cout << "c s pac guarantees epsilon: 0 delta: 0" << endl;
+    }
+    return true;
+}
+
 int main(int argc, char *argv[]) {
   mpf_set_default_prec(256);
   const double start_time = cpu_time();
@@ -797,6 +895,9 @@ int main(int argc, char *argv[]) {
   /*   generators = run_breakid(cnf); */
 
   if (!debug_arjun_cnf.empty()) cnf.write_simpcnf(debug_arjun_cnf, true);
+
+  // Attempt treewidth FPT WMC dispatch (after Arjun, on the simplified CNF)
+  if (try_tw_dispatch(cnf, start_time)) return 0;
 
   // Run Ganak
   Ganak counter(conf, fg);

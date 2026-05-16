@@ -88,6 +88,10 @@ struct CounterConfiguration {
   int do_rw = 0;        // 0 = disabled, 1 = use SOP DP when c rw_sop metadata present
   int rw_max_k = 12;    // skip SOP DP if computed rank-width exceeds this
 
+  // Treewidth FPT WMC: junction-tree DP on the primal graph (after Arjun)
+  int do_tw = 0;        // 0 = disabled, 1 = run junction-tree DP when tw <= tw_max_k
+  int tw_max_k = 20;    // skip junction-tree DP if treewidth exceeds this
+
   int do_td = 1;
   uint32_t td_varlim = 150000;
   double td_ratiolim = 100.0;
