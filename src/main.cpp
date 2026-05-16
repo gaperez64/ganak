@@ -317,7 +317,7 @@ void add_ganak_options()
     add_arg("--rwmaxk", conf.rw_max_k, fc_int, "Max rank-width to attempt SOP DP (larger widths fall back to DPLL)");
 
     // Treewidth FPT WMC options
-    add_arg("--tw", conf.do_tw, fc_int, "Treewidth WMC: 0=disabled, 1=run junction-tree DP when primal tw<=twmaxk (after Arjun)");
+    add_arg("--tw", conf.do_tw, fc_int, "Treewidth WMC: 0=disabled, 1=run junction-tree DP on incidence graph when tw<=twmaxk (before Arjun)");
     add_arg("--twmaxk", conf.tw_max_k, fc_int, "Max treewidth to attempt junction-tree DP (larger widths fall back to DPLL)");
 
     // Multi-threading options
@@ -701,7 +701,7 @@ static std::complex<double> field_to_cdbl(const CMSat::Field* f) {
     return {1.0, 0.0};
 }
 
-// Attempt junction-tree WMC dispatch (after Arjun simplification).
+// Attempt junction-tree WMC dispatch (before Arjun; Arjun only runs if this fails).
 // Returns true and prints output if the treewidth DP succeeds.
 static bool try_tw_dispatch(const ArjunNS::SimplifiedCNF& cnf, const double start_time) {
     if (conf.do_tw <= 0) return false;
@@ -877,6 +877,9 @@ int main(int argc, char *argv[]) {
     if (try_sop_dispatch(fname_for_sop, start_time)) return 0;
   }
 
+  // Attempt treewidth FPT WMC dispatch (before Arjun, on the original CNF)
+  if (try_tw_dispatch(cnf, start_time)) return 0;
+
   // Run Arjun
   if (!do_arjun) cnf.renumber_sampling_vars_for_ganak();
   else run_arjun(cnf);
@@ -895,9 +898,6 @@ int main(int argc, char *argv[]) {
   /*   generators = run_breakid(cnf); */
 
   if (!debug_arjun_cnf.empty()) cnf.write_simpcnf(debug_arjun_cnf, true);
-
-  // Attempt treewidth FPT WMC dispatch (after Arjun, on the simplified CNF)
-  if (try_tw_dispatch(cnf, start_time)) return 0;
 
   // Run Ganak
   Ganak counter(conf, fg);
